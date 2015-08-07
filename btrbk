@@ -45,9 +45,12 @@ use warnings FATAL => qw( all );
 use Carp qw(confess);
 use Date::Calc qw(Today Delta_Days Day_of_Week);
 use Getopt::Std;
+use IO::Handle;
+use IO::Select;
+use IPC::Open3 qw( open3 );
 use Data::Dumper;
 
-our $VERSION       = "0.20.0-dev";
+our $VERSION       = "0.20.0-dev-open3";
 our $AUTHOR        = 'Axel Burri <axel@tty0.ch>';
 our $PROJECT_HOME  = '<http://www.digint.ch/btrbk/>';
 
@@ -161,54 +164,158 @@ sub run_cmd(@)
   my @commands = (ref($_[0]) eq "HASH") ? @_ : { @_ };
   $err = "";
 
-  my $cmd = "";
-  my $name = "";
+  my $cmd_text = "";
   my $destructive = 0;
   my $pipe = "";
-  my $catch_stderr = 0;
-  my $filter_stderr = undef;
   foreach (@commands) {
     $_->{rsh} //= [];
     $_->{cmd} = [ @{$_->{rsh}}, @{$_->{cmd}} ];
     $_->{cmd_text} = join(' ', map { s/\n/\\n/g; "'$_'" } @{$_->{cmd}});  # ugly escape of \n, do we need to escape others?
-    $name = $_->{name} // $_->{cmd_text};
+    $_->{name} //= $_->{cmd_text};
     $_->{_buf} = '';
-    $cmd .= $pipe . $_->{cmd_text};
-    $pipe = ' | ';
-    if($_->{catch_stderr}) {
-      $cmd .= ' 2>&1';
-      $catch_stderr = 1;
-      $filter_stderr = $_->{filter_stderr};
-    }
+    $cmd_text .= $pipe . $_->{cmd_text};
+    $pipe = " | ";
     $destructive = 1 unless($_->{non_destructive});
   }
 
   if($dryrun && $destructive) {
-    DEBUG "### (dryrun) $cmd";
+    DEBUG "### (dryrun) $cmd_text";
     return "";
   }
-  DEBUG "### $cmd";
+  DEBUG "### $cmd_text";
 
-  my $ret = "";
-  $ret = `$cmd`;
-  chomp($ret);
-  TRACE "Command output:\n$ret";
-  if($?) {
-    my $exitcode= $? >> 8;
-    my $signal = $? & 127;
-    DEBUG "Command execution failed (exitcode=$exitcode" . ($signal ? ", signal=$signal" : "") . "): \"$cmd\"";
+  # local $| = 1;
+  # local $SIG{PIPE} = sub { ERROR "SIGPIPE"; };
+  # local $SIG{INT} = 'IGNORE';
+  # local $SIG{QUIT} = 'IGNORE';
+  local $SIG{CHLD} = sub {;};  # this is required! the default signal handler causes trouble here.
 
-    if($catch_stderr) {
-      $_ = $ret;
-      &{$filter_stderr} ($cmd) if($filter_stderr);
-      ERROR "[$cmd] $_" if($_);
+  # run commands
+  my $fh_out = undef;
+  foreach (@commands) {
+    my ($in, $out, $err);
+    my $chld_in;
+    if(defined $fh_out) {
+      $chld_in = '<&' . fileno($fh_out) ;  # open3 works with fd (don't know how to use fh together with '<&')
+      $in = $fh_out;
+    } else {
+      # first (leftmost) command gets a fresh fd
+      $in = new IO::Handle;
+      $chld_in = $in;
     }
-    return undef;
+    $out = new IO::Handle;
+    $err = new IO::Handle;
+
+    # fork a child process
+    $_->{PID} = open3($chld_in, $out, $err, @{$_->{cmd}}) || die "failed to fork child [$_->{name}]: $!";
+    # $out->autoflush(1);    # autoflush is not be needed when using sysread() below
+    # $err->autoflush(1);    # autoflush is not be needed when using sysread() below
+
+    $_->{fh_in} = $in;
+    $_->{fh_out} = $out;
+    $_->{fh_err} = $err;
+
+    TRACE "spawned child: pid=$_->{PID}, in=" . fileno($in) . ", out=" . fileno($out) . ", err=" . fileno($err) . ", cmd=\"$_->{cmd_text}\"";
+    unless(defined $fh_out) {
+      # close input filehandle of first command as soon as possible
+      TRACE "closing input filehandle: fd=" . fileno($in);
+      close($in);
+    }
+    $fh_out = $out;
   }
-  else {
-    DEBUG "Command execution successful";
+
+  # process output
+  my $select = new IO::Select;
+  foreach (@commands) {
+    TRACE "select: adding fd=" . fileno($_->{fh_err});
+    $select->add($_->{fh_err});
   }
-  return $ret;
+  TRACE "select: adding fd=" . fileno($fh_out);
+  $select->add($fh_out);
+
+  my $out = '';
+  while(my @fhs = $select->can_read) {
+    foreach my $fh (@fhs) {
+      my $fd = fileno($fh);
+      my $buf = '';
+
+      # NOTE: "perldoc -c sysread": It bypasses buffered IO, so mixing
+      #   this with other kinds of reads, "print", "write", "seek",
+      #   "tell", or "eof" can cause confusion because the perlio or
+      #   stdio layers usually buffers data.
+      # -> using WARN, TRACE, ... might cause trouble here!
+      my $bytes_read = sysread($fh, $buf, 4096);
+      # my $bytes_read = sysread($fh, $buf, 1);  # good for testing!
+      if((not defined($bytes_read)) || ($bytes_read < 0)) {
+        WARN "Error while reading from fd=$fd: $!";
+        # TRACE "ERR, removing fd=$fd";
+        $select->remove($fh);
+        next;
+      }
+      if ($bytes_read == 0) {
+        # TRACE "EOF, removing fd=$fd";
+        $select->remove($fh);
+        next;
+      }
+
+      if($fd == fileno($fh_out)) {
+        # TRACE "$bytes_read bytes read (total=" . length($out) . ") from stdout fd=$fd";
+        $out .= $buf;
+        next;
+      }
+
+      my $fh_handled = 0;
+      foreach my $cmd (@commands) {
+        if(fileno($fh) == fileno($cmd->{fh_err})) {
+          $fh_handled = 1;
+          $cmd->{_buf} .= $buf;
+          # TRACE "[$cmd->{name}] $bytes_read bytes read (total=" . length($cmd->{_buf}) . ") from err_fd=$fd";
+          last;
+        }
+      }
+      die "unexpected filehandle from select(): fd=$fd; $bytes_read bytes read" unless($fh_handled);
+    }
+  }
+
+
+  # wait for commands to exit and handle status
+  my $failed = 0;
+  foreach my $cmd (reverse @commands) {
+    TRACE "waiting for command to exit: $cmd->{name}";
+    waitpid($cmd->{PID}, 0);  # zombie prevention
+    my $status = $?;
+    if($status) {
+      my $exitcode= $status >> 8;
+      my $signal = $status & 127;
+      DEBUG "Command execution failed (exitcode=$exitcode" . ($signal ? ", signal=$signal" : "") . "): \"$cmd->{cmd_text}\"";
+      $failed = 1;
+    }
+
+    foreach (($cmd->{fh_in}, $cmd->{fh_out}, $cmd->{fh_err})) {
+      my $fd = fileno($_);
+      next unless($fd);
+      TRACE "closing filehandle: fd=$fd: $cmd->{name}";
+      close($_);
+    }
+  }
+
+  TRACE "processing stderr filter";
+  foreach my $cmd (@commands) {
+    foreach(split("\n", delete($cmd->{_buf}))) {
+      &{$cmd->{filter_stderr}} ($cmd->{name}) if($cmd->{filter_stderr});
+      ERROR "[$cmd->{name}] $_" if($_);
+    }
+  }
+  #  TRACE "processing stdout filter";
+  #  foreach(split("\n", $out)) {
+  #    &{$commands[-1]->{filter_stdout}} ($commands[-1]->{name}) if($commands[-1]->{filter_stdout});
+  #  }
+
+  return undef if($failed);
+
+  DEBUG "Command execution successful";
+
+  return $out;
 }
 
 
