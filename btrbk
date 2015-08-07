@@ -1029,16 +1029,39 @@ sub btrfs_send_receive($$$)
   push(@send_options, '-v') if($loglevel >= 3);
   push(@receive_options, '-v') if($loglevel >= 3);
 
+  my $filter_stderr = sub {
+    my $name = shift;
+    if(s/^ERROR: //) {
+      ERROR "[$name] $_";
+      $_ = undef;  # consume stderr line
+    }
+    elsif(s/^WARNING: //) {
+      WARN "[$name] $_";
+      $_ = undef;  # consume stderr line
+    }
+    elsif(/^At subvol/) {
+      INFO "[$name] $_";
+      $_ = undef;  # consume stderr line
+    }
+    elsif($loglevel >= 3) {
+      # treat all others as debug messages, those should only be printed if '-v' option is passed
+      DEBUG "[$name] $_";
+      $_ = undef;  # consume stderr line
+    }
+  };
+
   my $ret = run_cmd(
     {
       cmd => [ qw(btrfs send), @send_options, $snapshot_path ],
       rsh => $snapshot_rsh,
       name => "btrfs send",
+      filter_stderr => $filter_stderr,
     },
     {
       cmd => [ qw(btrfs receive), @receive_options, $target_path . '/' ],
       rsh => $target_rsh,
       name => "btrfs receive",
+      filter_stderr => $filter_stderr,
     },
    );
   unless(defined($ret)) {
