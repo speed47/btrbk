@@ -1939,7 +1939,9 @@ MAIN:
         {
           DEBUG "Creating raw subvolume list: $droot->{PRINT}";
           my $ret = run_cmd(
-            cmd => [ 'find', $droot->{PATH} . '/', '-maxdepth', '1', '-type', 'f' ],
+            # NOTE: check for file size >0, which causes bad (zero-sized) images to be resumed
+            # TODO: fix btrfs_send_to_file() to never create bad images
+            cmd => [ 'find', $droot->{PATH} . '/', '-maxdepth', '1', '-type', 'f', '-size', '+0' ],
             rsh => $droot->{RSH},
             # note: use something like this to get the real (link resolved) path
             # cmd => [ "find", $droot->{PATH} . '/', "-maxdepth", "1", "-name", "$snapshot_basename.\*.raw\*", '-printf', '%f\0', '-exec', 'realpath', '-z', '{}', ';' ],
