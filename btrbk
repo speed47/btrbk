@@ -47,7 +47,7 @@ use Date::Calc qw(Today Delta_Days Day_of_Week);
 use Getopt::Long qw(GetOptions);
 use Data::Dumper;
 
-our $VERSION       = "0.20.0";
+our $VERSION       = "0.21.0-dev--list_config";
 our $AUTHOR        = 'Axel Burri <axel@tty0.ch>';
 our $PROJECT_HOME  = '<http://www.digint.ch/btrbk/>';
 
@@ -151,6 +151,8 @@ sub HELP_MESSAGE
   print STDERR "   dryrun [subvol|group...]  don't run btrfs commands; show what would be executed\n";
   print STDERR "   tree   [subvol|group...]  shows backup tree\n";
   print STDERR "   info   [subvol|group...]  print useful filesystem information\n";
+  print STDERR "   list-source [subvol|group...]  print all source subvolumes\n";
+  print STDERR "   list-target [subvol|group...]  print all target subvolumes\n";
   print STDERR "   origin <subvol>           print origin information for subvolume\n";
   print STDERR "   diff   <from> <to>        shows new files since subvolume <from> for subvolume <to>\n";
   print STDERR "\n";
@@ -1504,7 +1506,7 @@ MAIN:
     WARN 'found option "--progress", but "pv" is not present: (please install "pv")';
     $show_progress = 0;
   }
-  my ($action_run, $action_info, $action_tree, $action_diff, $action_origin);
+  my ($action_run, $action_info, $action_tree, $action_diff, $action_origin, $action_list);
   my @filter_args;
   my $args_allow_group = 0;
   my ($args_expected_min, $args_expected_max) = (0, 0);
@@ -1538,6 +1540,13 @@ MAIN:
   elsif ($command eq "origin") {
     $action_origin = 1;
     $args_expected_min = $args_expected_max = 1;
+    @filter_args = @ARGV;
+  }
+  elsif (($command eq "list-source") || ($command eq "list-target")) {
+    $action_list = $command;
+    $args_expected_min = 0;
+    $args_expected_max = 9999;
+    $args_allow_group = 1;
     @filter_args = @ARGV;
   }
   else {
@@ -1692,7 +1701,7 @@ MAIN:
   #
   # filter subvolumes matching command line arguments
   #
-  if(($action_run || $action_tree || $action_info) && scalar(@filter_args))
+  if(($action_run || $action_tree || $action_info || $action_list) && scalar(@filter_args))
   {
     my $filter_count = undef;
     my @filter;
@@ -1792,6 +1801,45 @@ MAIN:
             print (btrfs_filesystem_usage($droot) // "");
             print "\n";
             $processed{$droot->{URL}} = 1;
+          }
+        }
+      }
+    }
+    exit 0;
+  }
+
+
+  if($action_list)
+  {
+    #
+    # print configuration lines, machine readable
+    #
+    foreach my $config_vol (@{$config->{VOLUME}}) {
+      next if($config_vol->{ABORTED});
+      my $sroot = vinfo($config_vol->{url}, $config_vol);
+      foreach my $config_subvol (@{$config_vol->{SUBVOLUME}}) {
+        next if($config_subvol->{ABORTED});
+        my $svol = vinfo_child($sroot, $config_subvol->{rel_path});
+        my @sline;
+        push @sline, "source_path=\"$svol->{PATH}\"";
+        push @sline, "snapshot_path=\"$sroot->{PATH}" . (config_key($config_subvol, "snapshot_dir", prefix => '/') // "") . "\"";
+        push @sline, "snapshot_basename=\"" . (config_key($config_subvol, "snapshot_name") // $svol->{NAME}) . "\"";
+        push @sline, "source_host=\"" . ($svol->{HOST} // "") . "\"";
+        push @sline, "source_rsh=\"" . ($sroot->{RSH} ? join(" ", @{$sroot->{RSH}}) : "") . "\"";
+
+        if($action_list eq "list-source") {
+          print join(' ', @sline) . "\n";
+        }
+        elsif($action_list eq "list-target")
+        {
+          foreach my $config_target (@{$config_subvol->{TARGET}})
+          {
+            my $droot = vinfo($config_target->{url}, $config_target);
+            my @dline = @sline;
+            push @dline, "target_path=\"$droot->{PATH}\"";
+            push @dline, "target_host=\"" . ($droot->{HOST} // "") . "\"";
+            push @dline, "target_rsh=\"" . ($droot->{RSH} ? join(" ", @{$droot->{RSH}}) : "") . "\"";
+            print join(' ', @dline) . "\n";
           }
         }
       }
